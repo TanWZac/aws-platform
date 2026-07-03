@@ -1,3 +1,4 @@
 .env
-*.sh
+# Ignore local helper scripts in the root only (e.g. gh_login.sh)
+/*.sh
 .DS_Store

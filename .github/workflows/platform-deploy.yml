@@ -74,13 +74,16 @@ jobs:
           terraform_version: "~1.6"
 
       - name: Terraform init
-        run: terraform init -input=false
+        run: |
+          terraform init \
+            -input=false \
+            -backend-config=environments/${{ inputs.environment }}/backend.hcl
 
       - name: Terraform plan
         run: |
           terraform plan \
             -input=false \
-            -var="environment=${{ inputs.environment }}" \
+            -var-file=environments/${{ inputs.environment }}/terraform.tfvars \
             -out=tfplan
 
       - name: Terraform apply
@@ -244,9 +247,11 @@ jobs:
             --cache-control "public,max-age=31536000,immutable" \
             --exclude "*.html"
 
+          # --exclude "*" is required before --include; without it, --include is a no-op
+          # and the second sync overwrites all files with no-cache headers.
           aws s3 sync out/ "s3://${S3}" --delete --region "$REGION" \
             --cache-control "public,max-age=0,must-revalidate" \
-            --include "*.html"
+            --exclude "*" --include "*.html"
 
       - name: Invalidate CloudFront
         run: |

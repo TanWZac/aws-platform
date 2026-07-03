@@ -134,7 +134,7 @@ aws s3 sync out/ "s3://${S3_BUCKET}" \
   --delete \
   --region "$AWS_REGION" \
   --cache-control "public,max-age=0,must-revalidate" \
-  --include "*.html"
+  --exclude "*" --include "*.html"
 
 popd > /dev/null
 

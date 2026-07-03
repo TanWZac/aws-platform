@@ -81,6 +81,12 @@ See [`contracts/ssm-parameters.yaml`](contracts/ssm-parameters.yaml) for the ful
 
 ---
 
+## Getting started
+
+[`docs/getting-started.md`](docs/getting-started.md) — Step-by-step guide: prerequisites → bootstrap → infrastructure → backend → frontend → CI/CD → Claude Code tooling → day-2 operations.
+
+---
+
 ## Contributing
 
 1. Changes to the API contract → update `contracts/api-contract.yaml` and open PRs in both `aws-python-platform-template` and `aws-web-platform-template`

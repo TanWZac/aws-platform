@@ -86,3 +86,55 @@ See [`contracts/ssm-parameters.yaml`](contracts/ssm-parameters.yaml) for the ful
 1. Changes to the API contract → update `contracts/api-contract.yaml` and open PRs in both `aws-python-platform-template` and `aws-web-platform-template`
 2. New infrastructure outputs → update `contracts/ssm-parameters.yaml` and the consuming repo's env var docs
 3. New repos → add to `platform.yaml` and this README
+
+---
+
+## Claude Code Setup (one-time per machine)
+
+All repos ship `CLAUDE.md`, `.mcp.json`, `.claudeignore`, and `.graphifyignore`. The tools below must be installed once before they activate.
+
+### Terminal installs
+
+```bash
+# 1. headroom — compresses tool output (bash, test results, logs) before it reaches Claude
+pip install headroom
+
+# 2. graphify — builds a queryable knowledge graph so Claude reads a graph query
+#    instead of raw files. Run once per machine, then /graphify . once per repo.
+uv tool install "graphifyy[terraform,sql]"
+graphify install          # registers the skill with Claude Code globally
+```
+
+After installing graphify, open Claude Code in each repo and run:
+```
+/graphify .
+```
+Then commit `graphify-out/` so the whole team starts with a map:
+```bash
+git add graphify-out/ && git commit -m "Add knowledge graph" && git push
+```
+
+### Claude Code plugin installs (two separate prompts each)
+
+```
+/plugin marketplace add DietrichGebert/ponytail
+/plugin install ponytail@ponytail
+```
+
+```
+/plugin marketplace add thedotmack/claude-mem
+/plugin install claude-mem@claude-mem
+```
+
+### What each tool does
+
+| Tool | Reduces | Improves |
+|---|---|---|
+| Mandarin `CLAUDE.md` | ~35% instruction tokens | — |
+| `.claudeignore` | Irrelevant file context | — |
+| **headroom** | 60–95% of tool output tokens | Signal-to-noise on test/log output |
+| **Context7** (auto via `.mcp.json`) | Hallucination correction loops | Accurate library API docs |
+| **Ponytail** | ~20% cost, ~27% time | Avoids over-engineering |
+| **Graphify** | Raw file reads → graph queries | Codebase understanding |
+| **claude-mem** | Re-exploration per session | Persistent cross-session memory |
+| `/compact` (workflow) | Long-session context drift | Attention on recent context |

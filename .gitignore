@@ -2,3 +2,6 @@
 # Ignore local helper scripts in the root only (e.g. gh_login.sh)
 /*.sh
 .DS_Store
+
+# Graphify — commit graphify-out/ for team knowledge graph, exclude local-only file
+graphify-out/cost.json

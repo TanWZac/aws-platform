@@ -1,0 +1,157 @@
+openapi: "3.1.0"
+
+info:
+  title: AWS Platform API
+  version: "0.1.0"
+  description: >
+    Backend API contract for the AWS Platform.
+    Source of truth shared between aws-python-platform-template (server)
+    and aws-web-platform-template (client).
+
+servers:
+  - url: http://localhost:8000
+    description: Local development
+  - url: https://{api_gateway_url}
+    description: AWS (API Gateway)
+    variables:
+      api_gateway_url:
+        description: Value of SSM /platform/{env}/api-gateway-url
+
+paths:
+  /health/live:
+    get:
+      summary: Liveness probe
+      description: Returns 200 immediately. Used by ECS health check.
+      tags: [health]
+      security: []
+      responses:
+        "200":
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiveResponse"
+
+  /health/ready:
+    get:
+      summary: Readiness probe
+      description: >
+        Checks all configured dependency URLs (READINESS_CHECK_URLS).
+        Returns 200 if all dependencies are reachable, 503 otherwise.
+      tags: [health]
+      security: []
+      responses:
+        "200":
+          description: Service and all dependencies are ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+        "503":
+          description: One or more dependencies are not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+
+  /api/v1/example:
+    get:
+      summary: Example endpoint
+      description: >
+        Returns a placeholder message from the example service.
+        Requires X-API-Key header when AUTH_ENABLED=true.
+      tags: [v1]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExampleResponse"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Auth is enabled but no API keys are configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: >
+        Required when AUTH_ENABLED=true on the backend.
+        Set via API_KEYS environment variable (comma-separated list).
+
+  schemas:
+    LiveResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          example: live
+
+    ReadyResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+          example: ready
+        app:
+          type: string
+          example: aws-python-platform-template
+        environment:
+          type: string
+          example: dev
+        version:
+          type: string
+          example: "0.1.0"
+        dependencies:
+          type: array
+          items:
+            $ref: "#/components/schemas/DependencyStatus"
+
+    DependencyStatus:
+      type: object
+      required: [url, status]
+      properties:
+        url:
+          type: string
+          format: uri
+        status:
+          type: string
+          enum: [ready, not_ready]
+        latency_ms:
+          type: number
+
+    ExampleResponse:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          example: "Platform service is running: replace this repository with your real integration"
+
+    ErrorResponse:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          example: unauthorized
+        message:
+          type: string
+          example: Invalid or missing API key

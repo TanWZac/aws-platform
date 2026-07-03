@@ -1,0 +1,204 @@
+name: Platform Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options: [dev, stage, prod]
+      component:
+        description: Component to deploy
+        required: true
+        type: choice
+        options: [all, infrastructure, backend, frontend]
+        default: all
+
+jobs:
+  # ── 1. Terraform ─────────────────────────────────────────────────────────────
+  infrastructure:
+    name: "1. Terraform (${{ inputs.environment }})"
+    runs-on: ubuntu-latest
+    if: inputs.component == 'all' || inputs.component == 'infrastructure'
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      api_gateway_url: ${{ steps.outputs.outputs.api_gateway_url }}
+      ecr_url: ${{ steps.outputs.outputs.ecr_url }}
+      ecs_cluster: ${{ steps.outputs.outputs.ecs_cluster }}
+      ecs_service: ${{ steps.outputs.outputs.ecs_service }}
+      s3_bucket: ${{ steps.outputs.outputs.s3_bucket }}
+      cf_dist_id: ${{ steps.outputs.outputs.cf_dist_id }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: TanWZac/aws-tf
+          token: ${{ secrets.PLATFORM_DEPLOY_TOKEN }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform apply
+        run: terraform apply -auto-approve -var="environment=${{ inputs.environment }}"
+
+      - name: Read SSM outputs
+        id: outputs
+        run: |
+          ENV="${{ inputs.environment }}"
+          REGION="${{ vars.AWS_REGION || 'us-east-1' }}"
+          get() { aws ssm get-parameter --name "/platform/$ENV/$1" --query Parameter.Value --output text --region "$REGION"; }
+          echo "api_gateway_url=$(get api-gateway-url)"     >> $GITHUB_OUTPUT
+          echo "ecr_url=$(get ecr-repository-url)"          >> $GITHUB_OUTPUT
+          echo "ecs_cluster=$(get ecs-cluster-name)"        >> $GITHUB_OUTPUT
+          echo "ecs_service=$(get ecs-service-name)"        >> $GITHUB_OUTPUT
+          echo "s3_bucket=$(get s3-frontend-bucket)"        >> $GITHUB_OUTPUT
+          echo "cf_dist_id=$(get cloudfront-distribution-id)" >> $GITHUB_OUTPUT
+
+  # ── 2. Backend ───────────────────────────────────────────────────────────────
+  backend:
+    name: "2. Backend (${{ inputs.environment }})"
+    runs-on: ubuntu-latest
+    needs: [infrastructure]
+    if: |
+      always() &&
+      (needs.infrastructure.result == 'success' || needs.infrastructure.result == 'skipped') &&
+      (inputs.component == 'all' || inputs.component == 'backend')
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: TanWZac/aws-python-platform-template
+          token: ${{ secrets.PLATFORM_DEPLOY_TOKEN }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Resolve SSM outputs (if infra step was skipped)
+        id: ssm
+        run: |
+          ENV="${{ inputs.environment }}"
+          REGION="${{ vars.AWS_REGION || 'us-east-1' }}"
+          get() { aws ssm get-parameter --name "/platform/$ENV/$1" --query Parameter.Value --output text --region "$REGION"; }
+          echo "ecr_url=${{ needs.infrastructure.outputs.ecr_url || '$(get ecr-repository-url)' }}" >> $GITHUB_OUTPUT
+          echo "ecs_cluster=${{ needs.infrastructure.outputs.ecs_cluster || '$(get ecs-cluster-name)' }}" >> $GITHUB_OUTPUT
+          echo "ecs_service=${{ needs.infrastructure.outputs.ecs_service || '$(get ecs-service-name)' }}" >> $GITHUB_OUTPUT
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        run: |
+          ECR_URL="${{ needs.infrastructure.outputs.ecr_url }}"
+          SHORT_SHA="${GITHUB_SHA::8}"
+          TAG="${{ inputs.environment }}-${SHORT_SHA}"
+
+          docker build -t "${ECR_URL}:${TAG}" -t "${ECR_URL}:${{ inputs.environment }}-latest" .
+          docker push "${ECR_URL}:${TAG}"
+          docker push "${ECR_URL}:${{ inputs.environment }}-latest"
+
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster "${{ needs.infrastructure.outputs.ecs_cluster }}" \
+            --service "${{ needs.infrastructure.outputs.ecs_service }}" \
+            --force-new-deployment \
+            --region "${{ vars.AWS_REGION || 'us-east-1' }}" \
+            --output text > /dev/null
+
+      - name: Wait for ECS stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ needs.infrastructure.outputs.ecs_cluster }}" \
+            --services "${{ needs.infrastructure.outputs.ecs_service }}" \
+            --region "${{ vars.AWS_REGION || 'us-east-1' }}"
+
+  # ── 3. Frontend ──────────────────────────────────────────────────────────────
+  frontend:
+    name: "3. Frontend (${{ inputs.environment }})"
+    runs-on: ubuntu-latest
+    needs: [infrastructure, backend]
+    if: |
+      always() &&
+      (needs.backend.result == 'success' || needs.backend.result == 'skipped') &&
+      (inputs.component == 'all' || inputs.component == 'frontend')
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: TanWZac/aws-web-platform-template
+          token: ${{ secrets.PLATFORM_DEPLOY_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Resolve SSM outputs (if infra step was skipped)
+        id: ssm
+        run: |
+          ENV="${{ inputs.environment }}"
+          REGION="${{ vars.AWS_REGION || 'us-east-1' }}"
+          get() { aws ssm get-parameter --name "/platform/$ENV/$1" --query Parameter.Value --output text --region "$REGION"; }
+          echo "api_url=$(get api-gateway-url)"             >> $GITHUB_OUTPUT
+          echo "s3_bucket=$(get s3-frontend-bucket)"        >> $GITHUB_OUTPUT
+          echo "cf_dist_id=$(get cloudfront-distribution-id)" >> $GITHUB_OUTPUT
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        env:
+          NEXT_PUBLIC_API_BASE_URL: ${{ needs.infrastructure.outputs.api_gateway_url || steps.ssm.outputs.api_url }}
+          NEXT_PUBLIC_APP_ENV: ${{ inputs.environment }}
+          NEXT_PUBLIC_APP_NAME: ${{ vars.APP_NAME || 'AWS Platform' }}
+        run: npm run build
+
+      - name: Sync to S3
+        run: |
+          S3="${{ needs.infrastructure.outputs.s3_bucket || steps.ssm.outputs.s3_bucket }}"
+          REGION="${{ vars.AWS_REGION || 'us-east-1' }}"
+
+          # Static assets — long cache
+          aws s3 sync out/ "s3://${S3}" --delete --region "$REGION" \
+            --cache-control "public,max-age=31536000,immutable" \
+            --exclude "*.html"
+
+          # HTML — no cache
+          aws s3 sync out/ "s3://${S3}" --delete --region "$REGION" \
+            --cache-control "public,max-age=0,must-revalidate" \
+            --include "*.html"
+
+      - name: Invalidate CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ needs.infrastructure.outputs.cf_dist_id || steps.ssm.outputs.cf_dist_id }}" \
+            --paths "/*" \
+            --output text > /dev/null

@@ -1,0 +1,102 @@
+# SSM Parameter Contract
+#
+# aws-tf WRITES these parameters after every Terraform apply.
+# aws-python-platform-template and aws-web-platform-template READ them at deploy time.
+#
+# Path convention: /platform/{env}/{key}
+# Environments:   dev | stage | prod
+
+parameters:
+  # ── Infrastructure outputs (written by aws-tf) ──────────────────────────────
+
+  - path: /platform/{env}/vpc-id
+    writer: aws-tf
+    type: String
+    description: VPC ID for the environment
+
+  - path: /platform/{env}/alb-dns-name
+    writer: aws-tf
+    type: String
+    description: Internal ALB DNS name (used by API Gateway integration)
+
+  - path: /platform/{env}/api-gateway-url
+    writer: aws-tf
+    type: String
+    description: Public HTTPS URL of the API Gateway stage (no trailing slash)
+    example: https://abc123.execute-api.us-east-1.amazonaws.com
+    consumed_by:
+      - aws-python-platform-template  # set as READINESS_CHECK_URLS
+      - aws-web-platform-template     # set as NEXT_PUBLIC_API_BASE_URL
+
+  - path: /platform/{env}/ecr-repository-url
+    writer: aws-tf
+    type: String
+    description: ECR repository URL for the application container image
+    consumed_by:
+      - aws-python-platform-template  # CI pushes Docker image here
+
+  - path: /platform/{env}/ecs-cluster-name
+    writer: aws-tf
+    type: String
+    description: ECS cluster name for service deployments
+    consumed_by:
+      - aws-python-platform-template  # CI triggers ECS service update
+
+  - path: /platform/{env}/ecs-service-name
+    writer: aws-tf
+    type: String
+    description: ECS service name to update on deploy
+    consumed_by:
+      - aws-python-platform-template
+
+  - path: /platform/{env}/cloudfront-domain
+    writer: aws-tf
+    type: String
+    description: CloudFront distribution domain for the frontend
+    example: d1234abcd.cloudfront.net
+    consumed_by:
+      - aws-web-platform-template     # CI sets as NEXT_PUBLIC_APP_ENV display info
+
+  - path: /platform/{env}/cloudfront-distribution-id
+    writer: aws-tf
+    type: String
+    description: CloudFront distribution ID for cache invalidation after deploy
+    consumed_by:
+      - aws-web-platform-template     # CI runs invalidation after S3 sync
+
+  - path: /platform/{env}/s3-frontend-bucket
+    writer: aws-tf
+    type: String
+    description: S3 bucket name for the static frontend assets
+    consumed_by:
+      - aws-web-platform-template     # CI syncs built `out/` here
+
+  # ── Application config (written by aws-tf or manually) ──────────────────────
+
+  - path: /platform/{env}/api-keys
+    writer: manual
+    type: SecureString
+    description: >
+      Comma-separated API keys for backend auth (AUTH_ENABLED=true).
+      Store as SecureString. Never log or print.
+    consumed_by:
+      - aws-python-platform-template  # set as API_KEYS env var
+
+  - path: /platform/{env}/cors-allow-origins
+    writer: aws-tf
+    type: String
+    description: Comma-separated allowed CORS origins
+    example: https://d1234abcd.cloudfront.net,http://localhost:3000
+    consumed_by:
+      - aws-python-platform-template  # set as CORS_ALLOW_ORIGINS
+
+# ── How to read a parameter in CI ────────────────────────────────────────────
+#
+# In GitHub Actions (requires aws-actions/configure-aws-credentials):
+#
+#   - name: Read SSM parameters
+#     run: |
+#       API_URL=$(aws ssm get-parameter \
+#         --name "/platform/${{ env.DEPLOY_ENV }}/api-gateway-url" \
+#         --query Parameter.Value --output text)
+#       echo "NEXT_PUBLIC_API_BASE_URL=$API_URL" >> $GITHUB_ENV

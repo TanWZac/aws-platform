@@ -1,0 +1,84 @@
+platform: aws-platform
+owner: TanWZac
+description: AWS-native web platform — infrastructure, backend API, and frontend browser layer.
+
+repos:
+  - name: aws-tf
+    role: infrastructure
+    url: https://github.com/TanWZac/aws-tf
+    deploy_order: 1
+    description: Terraform — VPC, ECS Fargate, ALB, API Gateway, S3, CloudFront, WAF, SageMaker
+    outputs:
+      # Written to SSM Parameter Store by Terraform
+      ssm:
+        - /platform/{env}/vpc-id
+        - /platform/{env}/alb-dns-name
+        - /platform/{env}/api-gateway-url
+        - /platform/{env}/ecr-repository-url
+        - /platform/{env}/ecs-cluster-name
+        - /platform/{env}/ecs-service-name
+        - /platform/{env}/cloudfront-domain
+        - /platform/{env}/s3-frontend-bucket
+
+  - name: aws-python-platform-template
+    role: backend-api
+    url: https://github.com/TanWZac/aws-python-platform-template
+    deploy_order: 2
+    depends_on: aws-tf
+    description: FastAPI service — health endpoints, API v1, structured logging, optional auth
+    language: python
+    runtime: ECS Fargate
+    port: 8000
+    consumes_ssm:
+      - /platform/{env}/api-gateway-url   # used for readiness dependency checks
+    env_vars:
+      - APP_NAME
+      - APP_ENV
+      - APP_VERSION
+      - APP_HOST
+      - APP_PORT
+      - LOG_LEVEL
+      - ENABLE_DOCS
+      - AUTH_ENABLED
+      - API_KEYS
+      - CORS_ALLOW_ORIGINS
+      - READINESS_CHECK_URLS
+      - READINESS_TIMEOUT_SECONDS
+    exposes:
+      - GET /health/live
+      - GET /health/ready
+      - GET /api/v1/example    # requires X-API-Key header when AUTH_ENABLED=true
+    api_contract: contracts/api-contract.yaml
+
+  - name: aws-web-platform-template
+    role: frontend
+    url: https://github.com/TanWZac/aws-web-platform-template
+    deploy_order: 3
+    depends_on: aws-python-platform-template
+    description: Next.js static export — dashboard, health, status, login pages
+    language: typescript
+    runtime: S3 + CloudFront
+    consumes_ssm:
+      - /platform/{env}/api-gateway-url   # set as NEXT_PUBLIC_API_BASE_URL at build time
+      - /platform/{env}/cloudfront-domain
+      - /platform/{env}/s3-frontend-bucket
+    env_vars:
+      - NEXT_PUBLIC_APP_NAME
+      - NEXT_PUBLIC_APP_ENV
+      - NEXT_PUBLIC_API_BASE_URL
+    api_contract: contracts/api-contract.yaml
+
+environments:
+  - name: dev
+    branch: main
+    aws_account_type: development
+    auto_deploy: true
+  - name: stage
+    branch: "release/*"
+    aws_account_type: development
+    auto_deploy: true
+  - name: prod
+    branch: "v*"
+    aws_account_type: production
+    auto_deploy: false
+    requires_approval: true

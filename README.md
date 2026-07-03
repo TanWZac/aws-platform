@@ -53,7 +53,13 @@ export ENV=dev
 
 ### Individual repo deploy
 
-Each repo has its own CI pipeline. See `.github/workflows/ci.yml` in each repo.
+Each repo has its own CI pipeline:
+
+| Repo | CI workflow |
+|---|---|
+| aws-tf | `.github/workflows/terraform-ci.yml` |
+| aws-python-platform-template | `.github/workflows/ci.yml` |
+| aws-web-platform-template | `.github/workflows/ci.yml` |
 
 ---
 

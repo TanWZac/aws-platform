@@ -38,7 +38,6 @@ jobs:
           AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
         run: |
           chmod +x scripts/preflight-check.sh
-          # Non-interactive in CI: skip prod confirmation prompt
           if [[ "${{ inputs.environment }}" == "prod" ]]; then
             echo "deploy prod" | ./scripts/preflight-check.sh ${{ inputs.environment }} ${{ inputs.component }}
           else
@@ -46,6 +45,9 @@ jobs:
           fi
 
   # ── 1. Terraform ─────────────────────────────────────────────────────────────
+  # PROD GATE: add required reviewers to the prod GitHub Environment so this job
+  # pauses for manual approval before apply runs.
+  # Repo → Settings → Environments → prod → Required reviewers.
   infrastructure:
     name: "1. Terraform (${{ inputs.environment }})"
     runs-on: ubuntu-latest
@@ -55,13 +57,6 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    outputs:
-      api_gateway_url: ${{ steps.outputs.outputs.api_gateway_url }}
-      ecr_url: ${{ steps.outputs.outputs.ecr_url }}
-      ecs_cluster: ${{ steps.outputs.outputs.ecs_cluster }}
-      ecs_service: ${{ steps.outputs.outputs.ecs_service }}
-      s3_bucket: ${{ steps.outputs.outputs.s3_bucket }}
-      cf_dist_id: ${{ steps.outputs.outputs.cf_dist_id }}
 
     steps:
       - uses: actions/checkout@v4
@@ -81,21 +76,15 @@ jobs:
       - name: Terraform init
         run: terraform init -input=false
 
-      - name: Terraform apply
-        run: terraform apply -auto-approve -var="environment=${{ inputs.environment }}"
-
-      - name: Read SSM outputs
-        id: outputs
+      - name: Terraform plan
         run: |
-          ENV="${{ inputs.environment }}"
-          REGION="${{ vars.AWS_REGION || 'us-east-1' }}"
-          get() { aws ssm get-parameter --name "/platform/$ENV/$1" --query Parameter.Value --output text --region "$REGION"; }
-          echo "api_gateway_url=$(get api-gateway-url)"     >> $GITHUB_OUTPUT
-          echo "ecr_url=$(get ecr-repository-url)"          >> $GITHUB_OUTPUT
-          echo "ecs_cluster=$(get ecs-cluster-name)"        >> $GITHUB_OUTPUT
-          echo "ecs_service=$(get ecs-service-name)"        >> $GITHUB_OUTPUT
-          echo "s3_bucket=$(get s3-frontend-bucket)"        >> $GITHUB_OUTPUT
-          echo "cf_dist_id=$(get cloudfront-distribution-id)" >> $GITHUB_OUTPUT
+          terraform plan \
+            -input=false \
+            -var="environment=${{ inputs.environment }}" \
+            -out=tfplan
+
+      - name: Terraform apply
+        run: terraform apply -input=false tfplan
 
   # ── 2. Backend ───────────────────────────────────────────────────────────────
   backend:
@@ -123,34 +112,58 @@ jobs:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
-      - name: Resolve SSM outputs (if infra step was skipped)
+      # Always resolve from SSM directly — never rely on infrastructure job outputs,
+      # which are empty when the job was skipped (e.g. backend-only deploy).
+      # Do NOT mix GitHub expression fallback (${{ x || 'y' }}) with shell
+      # substitution syntax — expressions evaluate before the shell runs and
+      # produce literal strings, not commands.
+      - name: Resolve SSM parameters
         id: ssm
         run: |
           ENV="${{ inputs.environment }}"
           REGION="${{ vars.AWS_REGION || 'us-east-1' }}"
-          get() { aws ssm get-parameter --name "/platform/$ENV/$1" --query Parameter.Value --output text --region "$REGION"; }
-          echo "ecr_url=${{ needs.infrastructure.outputs.ecr_url || '$(get ecr-repository-url)' }}" >> $GITHUB_OUTPUT
-          echo "ecs_cluster=${{ needs.infrastructure.outputs.ecs_cluster || '$(get ecs-cluster-name)' }}" >> $GITHUB_OUTPUT
-          echo "ecs_service=${{ needs.infrastructure.outputs.ecs_service || '$(get ecs-service-name)' }}" >> $GITHUB_OUTPUT
+          get() {
+            val=$(aws ssm get-parameter \
+              --name "/platform/$ENV/$1" \
+              --query Parameter.Value \
+              --output text \
+              --region "$REGION" 2>/dev/null) \
+            || { echo "::error::SSM /platform/$ENV/$1 not found. Run infrastructure deploy first." >&2; exit 1; }
+            echo "$val"
+          }
+          echo "ecr_url=$(get ecr-repository-url)"   >> "$GITHUB_OUTPUT"
+          echo "ecs_cluster=$(get ecs-cluster-name)" >> "$GITHUB_OUTPUT"
+          echo "ecs_service=$(get ecs-service-name)" >> "$GITHUB_OUTPUT"
 
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push image
+      - name: Build image
         run: |
-          ECR_URL="${{ needs.infrastructure.outputs.ecr_url }}"
           SHORT_SHA="${GITHUB_SHA::8}"
-          TAG="${{ inputs.environment }}-${SHORT_SHA}"
+          IMAGE="${{ steps.ssm.outputs.ecr_url }}:${{ inputs.environment }}-${SHORT_SHA}"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          docker build -t "$IMAGE" .
 
-          docker build -t "${ECR_URL}:${TAG}" -t "${ECR_URL}:${{ inputs.environment }}-latest" .
-          docker push "${ECR_URL}:${TAG}"
-          docker push "${ECR_URL}:${{ inputs.environment }}-latest"
+      - name: Scan image (block on CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@0.25.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 1
+
+      - name: Push image
+        # Push only the immutable SHA-tagged image. No mutable *-latest tag —
+        # latest tags break rollback traceability.
+        run: docker push "${{ env.IMAGE }}"
 
       - name: Deploy to ECS
         run: |
           aws ecs update-service \
-            --cluster "${{ needs.infrastructure.outputs.ecs_cluster }}" \
-            --service "${{ needs.infrastructure.outputs.ecs_service }}" \
+            --cluster "${{ steps.ssm.outputs.ecs_cluster }}" \
+            --service "${{ steps.ssm.outputs.ecs_service }}" \
             --force-new-deployment \
             --region "${{ vars.AWS_REGION || 'us-east-1' }}" \
             --output text > /dev/null
@@ -158,8 +171,8 @@ jobs:
       - name: Wait for ECS stability
         run: |
           aws ecs wait services-stable \
-            --cluster "${{ needs.infrastructure.outputs.ecs_cluster }}" \
-            --services "${{ needs.infrastructure.outputs.ecs_service }}" \
+            --cluster "${{ steps.ssm.outputs.ecs_cluster }}" \
+            --services "${{ steps.ssm.outputs.ecs_service }}" \
             --region "${{ vars.AWS_REGION || 'us-east-1' }}"
 
   # ── 3. Frontend ──────────────────────────────────────────────────────────────
@@ -193,37 +206,44 @@ jobs:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
-      - name: Resolve SSM outputs (if infra step was skipped)
+      # Always resolve from SSM directly — same reasoning as backend job.
+      - name: Resolve SSM parameters
         id: ssm
         run: |
           ENV="${{ inputs.environment }}"
           REGION="${{ vars.AWS_REGION || 'us-east-1' }}"
-          get() { aws ssm get-parameter --name "/platform/$ENV/$1" --query Parameter.Value --output text --region "$REGION"; }
-          echo "api_url=$(get api-gateway-url)"             >> $GITHUB_OUTPUT
-          echo "s3_bucket=$(get s3-frontend-bucket)"        >> $GITHUB_OUTPUT
-          echo "cf_dist_id=$(get cloudfront-distribution-id)" >> $GITHUB_OUTPUT
+          get() {
+            val=$(aws ssm get-parameter \
+              --name "/platform/$ENV/$1" \
+              --query Parameter.Value \
+              --output text \
+              --region "$REGION" 2>/dev/null) \
+            || { echo "::error::SSM /platform/$ENV/$1 not found. Run infrastructure deploy first." >&2; exit 1; }
+            echo "$val"
+          }
+          echo "api_url=$(get api-gateway-url)"               >> "$GITHUB_OUTPUT"
+          echo "s3_bucket=$(get s3-frontend-bucket)"          >> "$GITHUB_OUTPUT"
+          echo "cf_dist_id=$(get cloudfront-distribution-id)" >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
         run: npm ci
 
       - name: Build
         env:
-          NEXT_PUBLIC_API_BASE_URL: ${{ needs.infrastructure.outputs.api_gateway_url || steps.ssm.outputs.api_url }}
+          NEXT_PUBLIC_API_BASE_URL: ${{ steps.ssm.outputs.api_url }}
           NEXT_PUBLIC_APP_ENV: ${{ inputs.environment }}
           NEXT_PUBLIC_APP_NAME: ${{ vars.APP_NAME || 'AWS Platform' }}
         run: npm run build
 
       - name: Sync to S3
         run: |
-          S3="${{ needs.infrastructure.outputs.s3_bucket || steps.ssm.outputs.s3_bucket }}"
+          S3="${{ steps.ssm.outputs.s3_bucket }}"
           REGION="${{ vars.AWS_REGION || 'us-east-1' }}"
 
-          # Static assets — long cache
           aws s3 sync out/ "s3://${S3}" --delete --region "$REGION" \
             --cache-control "public,max-age=31536000,immutable" \
             --exclude "*.html"
 
-          # HTML — no cache
           aws s3 sync out/ "s3://${S3}" --delete --region "$REGION" \
             --cache-control "public,max-age=0,must-revalidate" \
             --include "*.html"
@@ -231,6 +251,6 @@ jobs:
       - name: Invalidate CloudFront
         run: |
           aws cloudfront create-invalidation \
-            --distribution-id "${{ needs.infrastructure.outputs.cf_dist_id || steps.ssm.outputs.cf_dist_id }}" \
+            --distribution-id "${{ steps.ssm.outputs.cf_dist_id }}" \
             --paths "/*" \
             --output text > /dev/null

@@ -41,3 +41,18 @@ terraform apply -var-file=environments/dev/terraform.tfvars
 - 禁止修改 `core/` 层基础中间件（`CorrelationIdMiddleware`、`SecurityHeadersMiddleware`）
 - 禁止跳过 `checks.tf` 中的生产保护检查
 - 禁止在前端使用服务端渲染（静态导出限制）
+
+## 工作流程规范
+
+### 复杂功能先写规格
+实现前须先写失败测试或功能规格（输入/输出/边界），再请 Claude 使其通过。
+
+### 长会话管理
+- 每 ~30 轮或上下文超 50% 时执行 `/compact`（压缩历史，消除"中间迷失"）
+- 任务切换时执行 `/clear`
+- 大型任务分解为独立子任务并行执行
+
+### 首次使用插件（在 Claude Code 中执行两条独立提示）
+claude-mem（跨会话记忆）：
+  /plugin marketplace add thedotmack/claude-mem
+  /plugin install claude-mem@claude-mem
